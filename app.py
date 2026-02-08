@@ -1,7 +1,12 @@
 import streamlit as st
 import requests
 import uuid
+from collections import Counter
 from dotenv import load_dotenv
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+import tempfile
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -99,7 +104,6 @@ if uploaded_file:
 def detect_intent(message: str):
     msg = message.lower()
 
-    # Specific intents first
     if any(w in msg for w in ["delete", "remove account", "close account"]):
         return "Account Deletion", 0.95
 
@@ -142,41 +146,45 @@ def openrouter_chat(message: str):
     if not api_key:
         return "OpenRouter API key not configured."
 
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "openrouter/auto",
-            "messages": [
-                {"role": "system", "content": "You are VeeraTech AI support."},
-                {"role": "user", "content": message}
-            ]
-        }
-    )
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "openrouter/auto",
+                "messages": [
+                    {"role": "system", "content": "You are VeeraTech AI support."},
+                    {"role": "user", "content": message}
+                ]
+            }
+        )
+        return response.json()["choices"][0]["message"]["content"]
+    except:
+        return "AI service temporarily unavailable."
 
-    return response.json()["choices"][0]["message"]["content"]
+# ---------------------------
+# PDF Export
+# ---------------------------
+def generate_chat_pdf(chat_history):
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    c = canvas.Canvas(temp_file.name, pagesize=letter)
+    y = 750
 
+    for chat in chat_history:
+        c.drawString(50, y, f"User: {chat['user']}")
+        y -= 20
+        c.drawString(50, y, f"AI: {chat['answer']}")
+        y -= 40
 
-def openai_chat(message: str):
-    from openai import OpenAI
-    api_key = st.secrets.get("OPENAI_API_KEY")
-    if not api_key:
-        return "OpenAI API key not configured."
+        if y < 100:
+            c.showPage()
+            y = 750
 
-    client = OpenAI(api_key=api_key)
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are VeeraTech AI support."},
-            {"role": "user", "content": message}
-        ]
-    )
-
-    return response.choices[0].message.content
+    c.save()
+    return temp_file.name
 
 # ---------------------------
 # Chat UI
@@ -188,10 +196,8 @@ if user_input:
     intent, confidence = detect_intent(user_input)
     source = "AI"
 
-    # Ticket ID generation
     ticket_id = f"VT-{str(uuid.uuid4())[:8].upper()}"
 
-    # Direct KB response
     if intent in KB_RESPONSES:
         answer = KB_RESPONSES[intent]
         source = "Knowledge Base"
@@ -203,21 +209,18 @@ if user_input:
         else:
             prompt = user_input
 
-        if model_choice == "OpenRouter":
-            answer = openrouter_chat(prompt)
-        else:
-            answer = openai_chat(prompt)
+        answer = openrouter_chat(prompt)
 
     action = automation_action(intent)
 
-    # Save to chat history
     st.session_state.chat_history.append({
         "user": user_input,
         "intent": intent,
         "confidence": confidence,
         "answer": answer,
         "action": action,
-        "ticket": ticket_id
+        "ticket": ticket_id,
+        "source": source
     })
 
 # ---------------------------
@@ -229,4 +232,39 @@ for chat in reversed(st.session_state.chat_history):
     st.write(f"**Intent:** {chat['intent']} ({chat['confidence']*100:.0f}% confidence)")
     st.write(f"**Response:** {chat['answer']}")
     st.write(f"**Automation:** {chat['action']}")
-    st.caption(f"Ticket ID: {chat['ticket']}")
+    st.caption(f"Ticket ID: {chat['ticket']} | Source: {chat['source']}")
+
+# ---------------------------
+# Sidebar Analytics
+# ---------------------------
+st.sidebar.header("📊 Analytics")
+
+if st.session_state.chat_history:
+    intents = [c["intent"] for c in st.session_state.chat_history]
+    counts = Counter(intents)
+
+    st.sidebar.write("Intent Distribution")
+    st.sidebar.bar_chart(counts)
+
+    st.sidebar.metric("Total Chats", len(st.session_state.chat_history))
+
+# ---------------------------
+# PDF Download
+# ---------------------------
+if st.session_state.chat_history:
+    if st.button("📄 Download Chat as PDF"):
+        pdf_path = generate_chat_pdf(st.session_state.chat_history)
+        with open(pdf_path, "rb") as f:
+            st.download_button(
+                label="Download PDF",
+                data=f,
+                file_name="chat_history.pdf",
+                mime="application/pdf"
+            )
+
+# ---------------------------
+# Clear chat
+# ---------------------------
+if st.sidebar.button("🧹 Clear Chat History"):
+    st.session_state.chat_history = []
+    st.experimental_rerun()
