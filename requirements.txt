@@ -3,9 +3,6 @@ requests
 python-dotenv
 langchain
 langchain-community
-langchain-text-splitters
-chromadb
-pypdf
 sentence-transformers
-numpy
-openai
+chromadb
+reportlab
