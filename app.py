@@ -7,11 +7,11 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 
-# Load env
+# Load environment variables
 load_dotenv()
 
 st.set_page_config(page_title="AI Support System", layout="wide")
-st.title("🤖 Automated AI Customer Support")
+st.title("🤖 VeeraTech AI Customer Support")
 
 # ---------------------------
 # Model selection
@@ -47,7 +47,7 @@ if uploaded_file:
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
     chunks = splitter.split_documents(docs)
 
-    # Free local embeddings (no OpenAI billing)
+    # Free local embeddings
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
@@ -135,7 +135,21 @@ if user_input:
     if st.session_state.db:
         docs = st.session_state.db.similarity_search(user_input, k=3)
         context = "\n".join([d.page_content for d in docs])
-        prompt = f"Answer using this context:\n{context}\n\nQuestion: {user_input}"
+
+        prompt = f"""
+You are a customer support assistant for VeeraTech AI Services.
+
+Use ONLY the information from the context below.
+Do not use outside knowledge.
+If the answer is not in the context, say:
+"I will connect you to human support."
+
+Context:
+{context}
+
+Customer Question:
+{user_input}
+"""
     else:
         prompt = user_input
 
