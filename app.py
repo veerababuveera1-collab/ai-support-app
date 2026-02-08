@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import uuid
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -13,6 +14,12 @@ load_dotenv()
 
 st.set_page_config(page_title="VeeraTech AI Support", layout="wide")
 st.title("🤖 VeeraTech AI Customer Support")
+
+# ---------------------------
+# Chat memory
+# ---------------------------
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 # ---------------------------
 # Built-in Knowledge Base
@@ -89,33 +96,34 @@ if uploaded_file:
 # ---------------------------
 # Intent detection
 # ---------------------------
-def detect_intent(message: str) -> str:
+def detect_intent(message: str):
     msg = message.lower()
 
-    if any(w in msg for w in ["password", "login", "locked", "account"]):
-        return "Account Issue"
+    # Specific intents first
+    if any(w in msg for w in ["delete", "remove account", "close account"]):
+        return "Account Deletion", 0.95
 
     elif any(w in msg for w in ["refund", "charged", "billing", "payment"]):
-        return "Billing Issue"
+        return "Billing Issue", 0.90
 
     elif any(w in msg for w in ["price", "plan", "cost", "pricing"]):
-        return "Sales Inquiry"
+        return "Sales Inquiry", 0.88
 
     elif any(w in msg for w in ["not working", "error", "bug", "issue"]):
-        return "Technical Issue"
+        return "Technical Issue", 0.85
 
     elif any(w in msg for w in ["contact", "support", "email", "whatsapp"]):
-        return "Contact"
+        return "Contact", 0.85
 
-    elif any(w in msg for w in ["delete", "remove account"]):
-        return "Account Deletion"
+    elif any(w in msg for w in ["password", "login", "locked"]):
+        return "Account Issue", 0.90
 
-    return "General Inquiry"
+    return "General Inquiry", 0.60
 
 # ---------------------------
 # Automation logic
 # ---------------------------
-def automation_action(intent: str) -> str:
+def automation_action(intent: str):
     actions = {
         "Account Issue": "Password reset link provided.",
         "Billing Issue": "Refund instructions sent.",
@@ -129,7 +137,7 @@ def automation_action(intent: str) -> str:
 # ---------------------------
 # AI Chat functions
 # ---------------------------
-def openrouter_chat(message: str) -> str:
+def openrouter_chat(message: str):
     api_key = st.secrets.get("OPENROUTER_API_KEY")
     if not api_key:
         return "OpenRouter API key not configured."
@@ -143,10 +151,7 @@ def openrouter_chat(message: str) -> str:
         json={
             "model": "openrouter/auto",
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You are VeeraTech AI support. Only answer about VeeraTech services."
-                },
+                {"role": "system", "content": "You are VeeraTech AI support."},
                 {"role": "user", "content": message}
             ]
         }
@@ -155,7 +160,7 @@ def openrouter_chat(message: str) -> str:
     return response.json()["choices"][0]["message"]["content"]
 
 
-def openai_chat(message: str) -> str:
+def openai_chat(message: str):
     from openai import OpenAI
     api_key = st.secrets.get("OPENAI_API_KEY")
     if not api_key:
@@ -166,7 +171,7 @@ def openai_chat(message: str) -> str:
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are VeeraTech AI support. Only answer about VeeraTech services."},
+            {"role": "system", "content": "You are VeeraTech AI support."},
             {"role": "user", "content": message}
         ]
     )
@@ -180,34 +185,24 @@ st.subheader("💬 Chat with AI Support")
 user_input = st.text_input("Type your message:")
 
 if user_input:
-    intent = detect_intent(user_input)
+    intent, confidence = detect_intent(user_input)
+    source = "AI"
+
+    # Ticket ID generation
+    ticket_id = f"VT-{str(uuid.uuid4())[:8].upper()}"
 
     # Direct KB response
     if intent in KB_RESPONSES:
         answer = KB_RESPONSES[intent]
+        source = "Knowledge Base"
     else:
-        # Use vector DB if available
         if st.session_state.db:
             docs = st.session_state.db.similarity_search(user_input, k=3)
             context = "\n".join([d.page_content for d in docs])
-
-            prompt = f"""
-You are a customer support assistant for VeeraTech AI Services.
-
-Use ONLY the information from the context below.
-If the answer is not in the context, say:
-"I will connect you to human support."
-
-Context:
-{context}
-
-Customer Question:
-{user_input}
-"""
+            prompt = f"Context:\n{context}\n\nQuestion:\n{user_input}"
         else:
             prompt = user_input
 
-        # Model selection
         if model_choice == "OpenRouter":
             answer = openrouter_chat(prompt)
         else:
@@ -215,11 +210,23 @@ Customer Question:
 
     action = automation_action(intent)
 
-    st.markdown("### 🧠 AI Analysis")
-    st.write(f"**Intent:** {intent}")
+    # Save to chat history
+    st.session_state.chat_history.append({
+        "user": user_input,
+        "intent": intent,
+        "confidence": confidence,
+        "answer": answer,
+        "action": action,
+        "ticket": ticket_id
+    })
 
-    st.markdown("### 🤖 AI Response")
-    st.write(answer)
-
-    st.markdown("### ⚙️ Automation Action")
-    st.success(action)
+# ---------------------------
+# Display chat history
+# ---------------------------
+for chat in reversed(st.session_state.chat_history):
+    st.markdown("---")
+    st.write(f"**User:** {chat['user']}")
+    st.write(f"**Intent:** {chat['intent']} ({chat['confidence']*100:.0f}% confidence)")
+    st.write(f"**Response:** {chat['answer']}")
+    st.write(f"**Automation:** {chat['action']}")
+    st.caption(f"Ticket ID: {chat['ticket']}")
