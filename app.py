@@ -1,270 +1,239 @@
 import streamlit as st
-import requests
-import uuid
-from collections import Counter
-from dotenv import load_dotenv
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-import tempfile
+import requests, os, sqlite3, bcrypt
+from datetime import datetime
+import matplotlib.pyplot as plt
+import re
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+# ======================
+# DATABASE SETUP
+# ======================
 
-# ---------------------------
-# Load environment variables
-# ---------------------------
-load_dotenv()
+conn = sqlite3.connect("autosolve.db", check_same_thread=False)
+c = conn.cursor()
 
-st.set_page_config(page_title="VeeraTech AI Support", layout="wide")
-st.title("🤖 VeeraTech AI Customer Support")
+c.execute("""CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    password BLOB,
+    tenant_id INTEGER
+)""")
 
-# ---------------------------
-# Chat memory
-# ---------------------------
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+c.execute("""CREATE TABLE IF NOT EXISTS workflows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id INTEGER,
+    name TEXT,
+    description TEXT,
+    created_at TEXT
+)""")
 
-# ---------------------------
-# Built-in Knowledge Base
-# ---------------------------
-KB_RESPONSES = {
-    "Account Issue":
-        "If your account is locked, reset your password here:\n"
-        "https://veeratech.ai/reset\n\n"
-        "If the issue continues, contact support@veeratech.ai.",
+c.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id INTEGER,
+    event_type TEXT,
+    event_data TEXT,
+    created_at TEXT
+)""")
 
-    "Billing Issue":
-        "Refunds are available within 7 days of purchase.\n"
-        "Email support@veeratech.ai with your order ID.",
+conn.commit()
 
-    "Sales Inquiry":
-        "Pricing Plans:\n"
-        "- Basic: $10/month – AI chat support\n"
-        "- Pro: $29/month – AI chat + automation\n"
-        "- Enterprise: Custom pricing",
+# ======================
+# AUTH
+# ======================
 
-    "Technical Issue":
-        "Try the following steps:\n"
-        "1. Refresh the page\n"
-        "2. Clear browser cache\n"
-        "3. Restart the application\n\n"
-        "If the issue continues, contact support@veeratech.ai.",
+def create_user(username, password):
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+    tenant_id = abs(hash(username)) % 10000
+    try:
+        c.execute(
+            "INSERT INTO users (username, password, tenant_id) VALUES (?, ?, ?)",
+            (username, hashed, tenant_id),
+        )
+        conn.commit()
+        return True
+    except:
+        return False
 
-    "Contact":
-        "Support Email: support@veeratech.ai\n"
-        "Support Hours: Mon–Fri, 9 AM – 6 PM IST\n"
-        "WhatsApp: +91-90000-00000",
+def authenticate(username, password):
+    c.execute("SELECT password, tenant_id FROM users WHERE username=?", (username,))
+    row = c.fetchone()
+    if row and bcrypt.checkpw(password.encode(), row[0]):
+        return row[1]
+    return None
 
-    "Account Deletion":
-        "To delete your account, email:\n"
-        "privacy@veeratech.ai"
-}
+def login_ui():
+    st.subheader("🔐 AutoSolve Login")
+    tab1, tab2 = st.tabs(["Login", "Signup"])
 
-# ---------------------------
-# Model selection
-# ---------------------------
-st.sidebar.header("⚙️ Model Settings")
-model_choice = st.sidebar.selectbox(
-    "Select AI Provider",
-    ["OpenRouter", "OpenAI"]
-)
+    with tab1:
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        if st.button("Login"):
+            tenant = authenticate(u, p)
+            if tenant:
+                st.session_state.user = u
+                st.session_state.tenant_id = tenant
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
 
-# ---------------------------
-# Vector DB setup
-# ---------------------------
-if "db" not in st.session_state:
-    st.session_state.db = None
+    with tab2:
+        u = st.text_input("New Username")
+        p = st.text_input("New Password", type="password")
+        if st.button("Create Account"):
+            if create_user(u, p):
+                st.success("Account created")
+            else:
+                st.error("Username exists")
 
-st.sidebar.header("📄 Upload Knowledge Document")
-uploaded_file = st.sidebar.file_uploader("Upload PDF or TXT", type=["pdf", "txt"])
+if "user" not in st.session_state:
+    login_ui()
+    st.stop()
 
-if uploaded_file:
-    with open(uploaded_file.name, "wb") as f:
-        f.write(uploaded_file.read())
+tenant_id = st.session_state.tenant_id
 
-    loader = PyPDFLoader(uploaded_file.name) if uploaded_file.name.endswith(".pdf") else TextLoader(uploaded_file.name)
-    docs = loader.load()
+# ======================
+# AI CONFIG
+# ======================
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-    chunks = splitter.split_documents(docs)
+API_KEY = os.getenv("OPENROUTER_API_KEY")
+URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "openai/gpt-4o-mini"  # fast model
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-
-    db = Chroma.from_documents(chunks, embeddings, persist_directory="db")
-    st.session_state.db = db
-    st.sidebar.success("Document loaded successfully!")
-
-# ---------------------------
-# Intent detection
-# ---------------------------
-def detect_intent(message: str):
-    msg = message.lower()
-
-    if any(w in msg for w in ["delete", "remove account", "close account"]):
-        return "Account Deletion", 0.95
-
-    elif any(w in msg for w in ["refund", "charged", "billing", "payment"]):
-        return "Billing Issue", 0.90
-
-    elif any(w in msg for w in ["price", "plan", "cost", "pricing"]):
-        return "Sales Inquiry", 0.88
-
-    elif any(w in msg for w in ["not working", "error", "bug", "issue"]):
-        return "Technical Issue", 0.85
-
-    elif any(w in msg for w in ["contact", "support", "email", "whatsapp"]):
-        return "Contact", 0.85
-
-    elif any(w in msg for w in ["password", "login", "locked"]):
-        return "Account Issue", 0.90
-
-    return "General Inquiry", 0.60
-
-# ---------------------------
-# Automation logic
-# ---------------------------
-def automation_action(intent: str):
-    actions = {
-        "Account Issue": "Password reset link provided.",
-        "Billing Issue": "Refund instructions sent.",
-        "Technical Issue": "Support steps provided.",
-        "Sales Inquiry": "Pricing details shared.",
-        "Contact": "Support contact details provided.",
-        "Account Deletion": "Privacy request instructions sent."
-    }
-    return actions.get(intent, "No automation required.")
-
-# ---------------------------
-# AI Chat functions
-# ---------------------------
-def openrouter_chat(message: str):
-    api_key = st.secrets.get("OPENROUTER_API_KEY")
-    if not api_key:
-        return "OpenRouter API key not configured."
+def call_ai(prompt):
+    if not API_KEY:
+        return "Missing OPENROUTER_API_KEY"
 
     try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+        r = requests.post(
+            URL,
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {API_KEY}",
                 "Content-Type": "application/json"
             },
             json={
-                "model": "openrouter/auto",
-                "messages": [
-                    {"role": "system", "content": "You are VeeraTech AI support."},
-                    {"role": "user", "content": message}
-                ]
-            }
+                "model": MODEL,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=60
         )
-        return response.json()["choices"][0]["message"]["content"]
+        return r.json()["choices"][0]["message"]["content"]
     except:
-        return "AI service temporarily unavailable."
+        return "AI service unavailable"
 
-# ---------------------------
-# PDF Export
-# ---------------------------
-def generate_chat_pdf(chat_history):
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    c = canvas.Canvas(temp_file.name, pagesize=letter)
-    y = 750
+# ======================
+# PROMPT SAFETY
+# ======================
 
-    for chat in chat_history:
-        c.drawString(50, y, f"User: {chat['user']}")
-        y -= 20
-        c.drawString(50, y, f"AI: {chat['answer']}")
-        y -= 40
+danger_patterns = [
+    r'password',
+    r'secret',
+    r'api_key',
+    r'drop table',
+    r'delete database'
+]
 
-        if y < 100:
-            c.showPage()
-            y = 750
+def is_safe(prompt):
+    for pattern in danger_patterns:
+        if re.search(pattern, prompt, re.IGNORECASE):
+            return False
+    return True
 
-    c.save()
-    return temp_file.name
+# ======================
+# AUDIT LOG
+# ======================
 
-# ---------------------------
-# Chat UI
-# ---------------------------
-st.subheader("💬 Chat with AI Support")
-user_input = st.text_input("Type your message:")
+def log_event(event_type, data):
+    c.execute(
+        "INSERT INTO audit_log VALUES (NULL,?,?,?,?)",
+        (tenant_id, event_type, data, datetime.now().isoformat())
+    )
+    conn.commit()
 
-if user_input:
-    intent, confidence = detect_intent(user_input)
-    source = "AI"
+# ======================
+# UI
+# ======================
 
-    ticket_id = f"VT-{str(uuid.uuid4())[:8].upper()}"
+st.set_page_config("AutoSolve", layout="wide")
+st.title("⚙️ AutoSolve – Enterprise AI Workflow Platform")
 
-    if intent in KB_RESPONSES:
-        answer = KB_RESPONSES[intent]
-        source = "Knowledge Base"
-    else:
-        if st.session_state.db:
-            docs = st.session_state.db.similarity_search(user_input, k=3)
-            context = "\n".join([d.page_content for d in docs])
-            prompt = f"Context:\n{context}\n\nQuestion:\n{user_input}"
+tabs = st.tabs([
+    "💬 AI Assistant",
+    "⚙️ Create Workflow",
+    "📁 My Workflows",
+    "📊 Analytics",
+    "📜 Audit Log"
+])
+
+# -------- AI ASSISTANT --------
+with tabs[0]:
+    q = st.chat_input("Ask AutoSolve...")
+    if q:
+        if not is_safe(q):
+            st.error("Prompt blocked for security reasons.")
         else:
-            prompt = user_input
+            ans = call_ai(q)
+            st.write(ans)
+            log_event("ai_query", q)
 
-        answer = openrouter_chat(prompt)
+# -------- CREATE WORKFLOW --------
+with tabs[1]:
+    name = st.text_input("Workflow name")
+    desc = st.text_area("Describe automation or AI workflow")
 
-    action = automation_action(intent)
-
-    st.session_state.chat_history.append({
-        "user": user_input,
-        "intent": intent,
-        "confidence": confidence,
-        "answer": answer,
-        "action": action,
-        "ticket": ticket_id,
-        "source": source
-    })
-
-# ---------------------------
-# Display chat history
-# ---------------------------
-for chat in reversed(st.session_state.chat_history):
-    st.markdown("---")
-    st.write(f"**User:** {chat['user']}")
-    st.write(f"**Intent:** {chat['intent']} ({chat['confidence']*100:.0f}% confidence)")
-    st.write(f"**Response:** {chat['answer']}")
-    st.write(f"**Automation:** {chat['action']}")
-    st.caption(f"Ticket ID: {chat['ticket']} | Source: {chat['source']}")
-
-# ---------------------------
-# Sidebar Analytics
-# ---------------------------
-st.sidebar.header("📊 Analytics")
-
-if st.session_state.chat_history:
-    intents = [c["intent"] for c in st.session_state.chat_history]
-    counts = Counter(intents)
-
-    st.sidebar.write("Intent Distribution")
-    st.sidebar.bar_chart(counts)
-
-    st.sidebar.metric("Total Chats", len(st.session_state.chat_history))
-
-# ---------------------------
-# PDF Download
-# ---------------------------
-if st.session_state.chat_history:
-    if st.button("📄 Download Chat as PDF"):
-        pdf_path = generate_chat_pdf(st.session_state.chat_history)
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                label="Download PDF",
-                data=f,
-                file_name="chat_history.pdf",
-                mime="application/pdf"
+    if st.button("Generate Workflow"):
+        if not is_safe(desc):
+            st.error("Unsafe workflow description.")
+        else:
+            result = call_ai(
+                f"Design an enterprise automation workflow:\n{desc}"
             )
+            c.execute(
+                "INSERT INTO workflows VALUES (NULL,?,?,?,?)",
+                (tenant_id, name, result, datetime.now().isoformat())
+            )
+            conn.commit()
+            log_event("workflow_created", name)
+            st.success("Workflow created")
+            st.write(result)
 
-# ---------------------------
-# Clear chat
-# ---------------------------
-if st.sidebar.button("🧹 Clear Chat History"):
-    st.session_state.chat_history = []
-    st.experimental_rerun()
+# -------- MY WORKFLOWS --------
+with tabs[2]:
+    c.execute(
+        "SELECT id,name,created_at FROM workflows WHERE tenant_id=?",
+        (tenant_id,)
+    )
+    for wid, name, created in c.fetchall():
+        if st.button(f"{name} ({created})", key=wid):
+            c.execute("SELECT description FROM workflows WHERE id=?", (wid,))
+            st.write(c.fetchone()[0])
+
+# -------- ANALYTICS --------
+with tabs[3]:
+    c.execute("SELECT COUNT(*) FROM workflows WHERE tenant_id=?", (tenant_id,))
+    wf_count = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM audit_log WHERE tenant_id=?", (tenant_id,))
+    log_count = c.fetchone()[0]
+
+    st.metric("Workflows", wf_count)
+    st.metric("Audit Events", log_count)
+
+    fig, ax = plt.subplots()
+    ax.bar(["Workflows", "Audit Events"], [wf_count, log_count])
+    st.pyplot(fig)
+
+# -------- AUDIT LOG --------
+with tabs[4]:
+    c.execute(
+        "SELECT event_type,event_data,created_at FROM audit_log "
+        "WHERE tenant_id=? ORDER BY id DESC LIMIT 20",
+        (tenant_id,)
+    )
+    logs = c.fetchall()
+    for e, d, t in logs:
+        st.write(f"[{t}] {e} → {d}")
+
+# -------- LOGOUT --------
+if st.sidebar.button("Logout"):
+    st.session_state.clear()
+    st.rerun()
