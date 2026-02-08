@@ -1,9 +1,12 @@
 streamlit
 openai
+python-dotenv
 langchain
 langchain-community
 langchain-openai
+langchain-text-splitters
 chromadb
 pypdf
-python-dotenv
-
+tiktoken
+requests
+numpy
